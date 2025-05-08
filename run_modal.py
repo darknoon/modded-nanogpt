@@ -45,11 +45,17 @@ def prepare_dataset():
 
 
 @app.function(
-    image=train_image, gpu="H100:8", volumes={"/modded-nanogpt/data/fineweb10B": volume}
+    image=train_image,
+    cpu=16.0,
+    gpu="H100:8",
+    volumes={"/modded-nanogpt/data/fineweb10B": volume},
+    # timeout is 20 minutes, training should only take 3 minutes but warmup etc.
+    timeout=20 * 60,
 )
 def fit():
     cmd = "torchrun --standalone --nproc_per_node=8 train_gpt.py"
-    subprocess.run(cmd, shell=True)
+    # Use text=True and capture_output=False to ensure logs are streamed to console
+    subprocess.run(cmd, shell=True, check=True, text=True, capture_output=False)
 
 
 @app.local_entrypoint()
