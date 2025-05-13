@@ -5,6 +5,9 @@ import os
 # Create a Modal Volume for caching the dataset
 volume = modal.Volume.from_name("fineweb10b-cache", create_if_missing=True)
 
+# Create a Modal Volume for storing training logs
+logs_volume = modal.Volume.from_name("nanogpt-logs", create_if_missing=True)
+
 # Simple image for downloading data
 download_image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -48,7 +51,10 @@ def prepare_dataset():
     image=train_image,
     cpu=16.0,
     gpu="H100:8",
-    volumes={"/modded-nanogpt/data/fineweb10B": volume},
+    volumes={
+        "/modded-nanogpt/data/fineweb10B": volume,
+        "/modded-nanogpt/logs": logs_volume,
+    },
     # timeout is 20 minutes, training should only take 3 minutes but warmup etc.
     timeout=20 * 60,
 )
@@ -56,6 +62,8 @@ def fit():
     cmd = "torchrun --standalone --nproc_per_node=8 train_gpt.py"
     # Use text=True and capture_output=False to ensure logs are streamed to console
     subprocess.run(cmd, shell=True, check=True, text=True, capture_output=False)
+    # Ensure logs are committed to the volume
+    logs_volume.commit()
 
 
 @app.local_entrypoint()

@@ -1,0 +1,5 @@
+{
+    "ruff.exclude": [
+        "train_*.py"
+    ]
+}
