@@ -38,7 +38,8 @@ app = modal.App(name="modded-nanogpt")
 )
 def prepare_dataset():
     # Check if dataset already exists in volume
-    if not os.path.exists("/modded-nanogpt/data/fineweb10B/fineweb_train_000028.bin"):
+    # We only need the first 8 chunks for this speedrun
+    if not os.path.exists("/modded-nanogpt/data/fineweb10B/fineweb_train_000007.bin"):
         print("Dataset not found in volume, downloading...")
         cmd = "python data/cached_fineweb10B.py 8"
         subprocess.run(cmd, shell=True)
@@ -49,7 +50,6 @@ def prepare_dataset():
 
 @app.function(
     image=train_image,
-    cpu=16.0,
     gpu="H100:8",
     volumes={
         "/modded-nanogpt/data/fineweb10B": volume,
