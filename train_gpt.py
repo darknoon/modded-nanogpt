@@ -260,6 +260,7 @@ class CausalSelfAttention(nn.Module):
         # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
         self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
+        self.canon_b = CanonIndividual(dim * 3) if args.canon_b else None
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(head_dim, max_seq_len)
         self.c_proj = CastedLinear(hdim, dim)
@@ -268,7 +269,10 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        qkv = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim)
+        if self.canon_b is not None:
+            qkv = qkv + self.canon_b(qkv)
+        q, k, v = qkv.chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         if ve is not None:
@@ -287,27 +291,96 @@ class MLP(nn.Module):
         super().__init__()
         hdim = 4 * dim
         self.c_fc = CastedLinear(dim, hdim)
+        self.canon_d = CanonIndividual(hdim) if args.canon_d else None
         self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x: Tensor):
         x = self.c_fc(x)
+        # horizontal residual connection to previous tokens
+        if self.canon_d is not None:
+            x = x + self.canon_d(x)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
         return x
 
+class CanonConv1d(nn.Module):
+    """
+    "Canon", ie modulated delay, layer as proposed in phys lm 4.1 @darknoon
+    Implemented as a causal conv that only attends to past tokens.
+    We implement it as a conv1d. this doesn't account for document boundaries yet :/
+    """
+    def __init__(self, dim: int, kernel_size: int = 4):
+        super().__init__()
+        self.conv = nn.Conv1d(dim, dim, kernel_size=kernel_size, padding=kernel_size-1)
+
+    def forward(self, x: Tensor):
+        # Transpose for conv1d which expects [B, C, T]
+        x_conv = x.transpose(1, 2)
+        # Apply causal convolution (only keep the valid part to ensure causality)
+        conv_out = self.conv(x_conv)
+        conv_out = conv_out[:, :, :x_conv.size(2)]
+        # Transpose back to [B, T, C]
+        conv_out = conv_out.transpose(1, 2)
+        return conv_out
+
+class CanonIndividual(nn.Module):
+    """
+    Implemented as multiple linear layers with different shifts, to handle the document masking more easily.
+    """
+    def __init__(self, dim: int, kernel_size: int = 4):
+        super().__init__()
+        self.lin0 = CastedLinear(dim, dim)
+        self.lin1 = CastedLinear(dim, dim)
+        self.lin2 = CastedLinear(dim, dim)
+        self.lin3 = CastedLinear(dim, dim)
+
+    def forward(self, x: Tensor, document_mask: Tensor = None):
+        # Shift x for lin1 by 1, lin2 by 2, lin3 by 3
+        x_sh1 = F.pad(x[:, :-1], (0, 0, 1, 0))  # Shift right by 1
+        x_sh2 = F.pad(x[:, :-2], (0, 0, 2, 0))  # Shift right by 2
+        x_sh3 = F.pad(x[:, :-3], (0, 0, 3, 0))  # Shift right by 3
+        
+        # TODO: Apply document mask to prevent attending across document boundaries
+        if document_mask is not None:
+            # Create shifted masks
+            doc_sh1 = F.pad(document_mask[:, :-1], (1, 0))  # Shift right by 1
+            doc_sh2 = F.pad(document_mask[:, :-2], (2, 0))  # Shift right by 2
+            doc_sh3 = F.pad(document_mask[:, :-3], (3, 0))  # Shift right by 3
+            
+            mask_sh1 = doc_sh1 == document_mask
+            mask_sh2 = (x_sh2 == 0) * doc_sh2
+            mask_sh3 = (x_sh3 == 0) * doc_sh3
+
+            # Zero out positions that cross document boundaries
+            x_sh1 = x_sh1 * mask_sh1.unsqueeze(-1)
+            x_sh2 = x_sh2 * mask_sh2.unsqueeze(-1)
+            x_sh3 = x_sh3 * mask_sh3.unsqueeze(-1)
+        
+        return self.lin0(x) + self.lin1(x_sh1) + self.lin2(x_sh2) + self.lin3(x_sh3)
+
+
+
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
         super().__init__()
+        self.canon_a = CanonIndividual(dim) if args.canon_a else None
+        self.canon_c = CanonIndividual(dim) if args.canon_c else None
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
         self.mlp = MLP(dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
+        # residual connection
         x = self.lambdas[0] * x + self.lambdas[1] * x0
+        # temporal "residual" connection from previous
+        if self.canon_a is not None:
+            x = x + self.canon_a(x)
         if self.attn is not None:
             x = x + self.attn(norm(x), ve, block_mask)
+        if self.canon_c is not None:
+            x = x + self.canon_c(x)
         x = x + self.mlp(norm(x))
         return x
 
@@ -454,6 +527,10 @@ class Hyperparameters:
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
+    canon_a = True
+    canon_b = True
+    canon_c = True
+    canon_d = False
 args = Hyperparameters()
 
 # torchrun sets these env variables
@@ -486,12 +563,47 @@ print0(code)
 print0("="*100)
 # log information about the hardware/software environment this is running on
 print0(f"Running Python {sys.version}")
-print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
+print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda} + CUDNN {torch.backends.cudnn.version()}")
 def nvidia_smi():
     import subprocess  # avoid top level import
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
 print0(nvidia_smi())
 print0("="*100)
+
+# -----------------------------------------------------------------------------
+# BEGIN Profiler
+from contextlib import nullcontext
+
+profile = True
+wait, warmup, active, repeat = 5, 5, 5, 2
+
+def trace_handler(prof):
+    print("Handling torch profiler trace...")
+    torch.profiler.tensorboard_trace_handler(dir_name=f"logs/{run_id}/bench_log")(prof)
+
+profiler = (
+    nullcontext()
+    if not profile
+    else torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(
+            wait=wait, warmup=warmup, active=active, repeat=repeat
+        ),
+        on_trace_ready=trace_handler,
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,  # incurs an additional overhead, disable if not needed
+        with_flops=True,
+        with_modules=False,  # only for torchscript models atm
+    )
+)
+# END Profiler
+# -----------------------------------------------------------------------------
+
+
 
 ########################################
 #    Construct model and optimizer     #
@@ -554,7 +666,9 @@ model: nn.Module = torch.compile(model, dynamic=False)
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
+profiler.start()
 for _ in range(warmup_steps):
+    print0(f"Warmup step {_} of {warmup_steps}", console=True)
     inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
     model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
     for param in model.parameters():
@@ -562,6 +676,8 @@ for _ in range(warmup_steps):
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
+    profiler.step()
+profiler.stop()
 model.load_state_dict(initial_state["model"])
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
     opt.load_state_dict(opt_state)
